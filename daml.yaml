@@ -1,0 +1,22 @@
+sdk-version: 1.9.0
+name: prediction
+source: daml
+init-script: Main:example
+parties:
+  - u1
+  - u2
+  - u3
+  - public
+  - o1
+  - o2
+  - o3
+  - Bank
+  - Market
+version: 0.0.1
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+  - daml-trigger
+sandbox-options:
+  - --static-time

@@ -1,0 +1,35 @@
+module ResolutionTrigger where
+
+import DA.Date
+import DA.Time 
+import Daml.Trigger hiding (Event)
+import Main
+import DA.List
+import DA.Optional (isNone)
+
+-- market operator periodically checks whether any events are due
+eventResolution: Trigger()
+eventResolution = Trigger with
+    initialize = pure ()
+    updateState = \_message -> pure ()
+    rule = resolveDueEvents
+    registeredTemplates = AllInDar
+    heartbeat = Some $ seconds 5
+
+-- checks for active, due events
+-- uses resolveEvent choice of the market operator to resolve them
+resolveDueEvents: Party -> TriggerA () ()
+resolveDueEvents market = do 
+  markets: [(ContractId Market, Market)] <- query @Market
+  let (marketCId, market) = head markets
+
+  events <- query @Event
+  now <- getTime
+  let dueEvents = filter(\(_, e) -> e.resolutionDate < toDateUTC now && isNone e.outcome) events
+  if null dueEvents then do
+    debug("No due events found")
+    pure()
+  else do
+    forA dueEvents $ \(eventCId, event) -> dedupExercise marketCId ResolveEvent with event = event
+    forA dueEvents $ \(eventCId, event) -> debug("Event ", event.description, "is being resolved")
+    pure()

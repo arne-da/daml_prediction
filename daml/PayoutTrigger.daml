@@ -1,0 +1,57 @@
+module PayoutTrigger where
+
+import DA.List
+import Daml.Trigger hiding (Event)
+import Main
+import DA.Foldable (forA_)
+import DA.Time 
+
+
+-- market operator periodically checks whether any resolved events need to be paid out
+escrowPayout: Trigger()
+escrowPayout = Trigger with
+    initialize = pure ()
+    updateState = \_message -> pure ()
+    rule = payoutWinners
+    registeredTemplates = AllInDar
+    heartbeat = Some $ seconds 5
+
+-- idea: payout those market participants who held correct prediction for resolved events
+-- payout happens via using the escrows which were previously given to the market
+payoutWinners: Party -> TriggerA () ()
+payoutWinners market = do 
+  markets: [(ContractId Market, Market)] <- query @Market
+  let (marketCId, market) = head markets
+
+  events <- query @Event
+  now <- getTime
+  outcomes <- query @EventOutcome
+  if null outcomes then do pure()
+  else do
+    let (eventOutcomeCId, eventOutcome) = head outcomes
+    let event = eventOutcome.event
+    let outcome = eventOutcome.eventOccured
+    escrows <- query @Escrow
+
+    let winnersEscrows = filter(\(_, escrow) -> escrow.event == event) escrows
+    -- fitting ownerships -> correct ownerships -> winners
+    ownerships <- query @PredictionOwnership
+    let fittingOwnerships = filter(\(_, ownership) -> ownership.prediction.event == event) ownerships
+    let correctOwnerships = filter(\(_, ownership) -> 
+            ownership.prediction.eventOccurs == outcome) fittingOwnerships
+
+    let exerciseTransferAndArchiveOwnership: (ContractId Escrow, Escrow) -> (ContractId PredictionOwnership, PredictionOwnership) -> TriggerA () () = \(cidEscrow, escrow) -> \(cidOwnership, ownership) -> 
+          do
+            dedupExercise escrow.iou Transfer with newOwner = ownership.owner.user
+            dedupExercise cidOwnership Archive
+            dedupExercise cidEscrow Archive
+
+    let updates = zipWith exerciseTransferAndArchiveOwnership winnersEscrows correctOwnerships 
+    forA_ updates $ \update -> update
+
+
+    let wrongOwnerships = map fst $ filter(\(_, ownership) -> ownership.prediction.eventOccurs /= outcome) fittingOwnerships
+    forA_ wrongOwnerships $ \wrong -> dedupExercise wrong Archive
+    dedupExercise eventOutcomeCId Archive 
+    debug("Payout for event ", event.description, "was successful")
+    pure()

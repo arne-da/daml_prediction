@@ -1,0 +1,632 @@
+module Main where
+
+import Daml.Script
+import DA.Date as D
+import DA.Time
+
+
+type Price = Decimal
+type UUID = Int
+
+template Event
+  with
+    description: Text
+    resolutionDate: Date
+    market: Party
+    oracle: Oracle
+    outcome: Optional Bool
+    public: Party
+  where
+    signatory market 
+    observer public
+    key (description, market): (Text, Party)
+    maintainer key._2
+
+    controller market can
+      UpdateEventWithOutcome: ContractId Event
+        with newOutcome: Bool
+        do
+          create this with outcome = Some newOutcome
+    
+data Prediction = Prediction with
+    event: Event
+    eventOccurs: Bool
+      deriving (Eq, Show)
+
+
+template Escrow
+  with
+    event: Event
+    iou: ContractId Iou
+  where
+    signatory (signatory event)
+
+template Market
+  with
+    owner: Party
+  where
+    signatory owner
+
+    controller owner can
+      nonconsuming ResolveEvent: EventOutcome
+        with event: Event
+        do
+          Some decision <- exerciseByKey @Oracle event.oracle.entity (AttemptEventResolution event)
+          let outcome = EventOutcome with event = event; eventOccured = decision
+          outcomeCId <- create outcome
+
+          exerciseByKey @Event (event.description, owner) UpdateEventWithOutcome with newOutcome = decision
+
+          pure outcome
+    
+
+template EventOutcome
+  with
+    event: Event
+    eventOccured: Bool
+  where
+    signatory (signatory event)
+
+    controller (signatory event) can
+      nonconsuming GetResult: Bool
+        do return eventOccured
+    
+template Oracle
+  with
+    entity: Party
+    eventResolutions: [(Event, Bool)]
+    market: Market
+    public: Party
+  where
+    signatory entity
+    observer market.owner, public
+    key (entity): Party
+    maintainer key
+
+    controller market.owner can
+      AttemptEventResolution: Optional Bool
+        with
+          event: Event
+        do
+          
+          now <- getTime
+          if toDateUTC now < event.resolutionDate then return None
+          else do
+            let bigbang = time (date 1 Jan 1) 0 0 0
+            let difference = convertRelTimeToMicroseconds $ subTime now bigbang 
+            -- questionable random number generator
+            let outcome = difference % 2 == 0
+            create this with eventResolutions = (event, outcome) :: eventResolutions
+            return $ Some outcome
+
+
+
+template Participant
+  with
+    user: Party
+    name: Text
+  where
+    signatory user
+
+    key user : Party
+    maintainer key
+
+    controller user can
+      nonconsuming CreateBuyProposal: ContractId BuyProposal
+        with
+          iou: ContractId Iou
+          prediction: Prediction
+          public: Party
+          uuid: UUID
+        do
+          -- divulge iou to public (otherwise the public/the seller won't be able to execute the transfer choice
+          -- on the ownership when accepting the buy proposal)
+          showIouToPublic <- exercise iou ShowIouOwnership with prospect = public
+          exercise showIouToPublic ConsumeShowIou 
+          create BuyProposal 
+            with 
+              buyer = this
+              ..
+      
+      nonconsuming CreateSellProposal: ContractId SellProposal
+        with
+          price: Price
+          prediction: ContractId PredictionOwnership
+          public: Party
+          uuid: UUID
+        do
+          -- divulge ownership to public (otherwise the public/the buyer won't be able to execute the transfer choice
+          -- on the ownership when accepting the sell proposal)
+          showOwnershipToPublic <- exercise prediction ShowOwnership with prospect = public
+          exercise showOwnershipToPublic ConsumeShowPredictionOwnership 
+          create SellProposal with seller = this; ..
+
+      nonconsuming RequestParticipation: ContractId ParticipationRequest
+        with
+          market: Market
+        do 
+          create ParticipationRequest with
+            participant = this
+            market = market
+    
+
+template ParticipationRequest
+  with
+    participant: Participant
+    market: Market
+  where
+    signatory participant.user
+    controller market.owner can
+      Accept: ContractId ServiceAgreement
+        do 
+          create ServiceAgreement with ..
+
+template ServiceAgreement
+  with
+    participant: Participant
+    market: Market
+  where 
+    signatory market.owner, participant.user
+
+    controller participant.user can
+      nonconsuming BuyIn: (ContractId PredictionOwnership, ContractId PredictionOwnership)
+        with
+          event: Event
+          iouCId: ContractId Iou
+        do
+          let yesPrediction = Prediction with event =  event; eventOccurs = True
+          let noPrediction = Prediction with event =  event; eventOccurs = False
+
+          yesOwnership <- create PredictionOwnership with owner = participant; prediction = yesPrediction; ..
+          noOwnership <- create PredictionOwnership with owner = participant; prediction = noPrediction; ..
+          
+          iou <- fetch iouCId
+          assertMsg "Iou must have value of 1.0" (iou.amount == 1.0)
+          newIou <- exercise iouCId Transfer with newOwner = market.owner
+
+          create Escrow with iou = newIou; ..
+
+          return (noOwnership, yesOwnership)
+      
+          
+          
+template BuyProposal
+  with
+    buyer: Participant
+    iou: ContractId Iou
+    prediction: Prediction
+    public: Party 
+    uuid: UUID
+  where
+    signatory (signatory buyer)
+    observer public
+    key (buyer.user, public, uuid): (Party, Party, Int)
+    maintainer key._1
+    
+    controller buyer.user can
+      CancelBuyProposal: ()
+        do pure()
+
+    controller public can
+  
+      nonconsuming ShowIouToPublic: Iou
+        do
+          fetch iou
+
+    choice AcceptBuyProposal: ()
+        with
+          seller: Participant
+          offeredPredictionCId: ContractId PredictionOwnership
+        controller seller.user
+        do
+          offeredPrediction <- fetch offeredPredictionCId
+          exercise iou Transfer with newOwner = seller.user
+          exercise offeredPredictionCId TransferPrediction with newOwner = buyer
+          pure()
+
+
+
+template SellProposal
+  with
+    seller: Participant
+    price: Price
+    prediction: ContractId PredictionOwnership
+    public: Party
+    uuid: UUID
+  where
+    signatory (signatory seller)
+    observer public
+    key (seller.user, uuid): (Party, Int)
+    maintainer key._1
+    ensure price > 0.0
+
+    controller seller.user can
+      CancelSellProposal: ()
+        do pure ()
+
+    controller public can
+      
+          nonconsuming ShowPredictionToPublic: PredictionOwnership
+            do
+              fetch prediction
+
+    choice AcceptSellProposal: ()
+      with 
+        buyer: Participant
+        iouCId: ContractId Iou
+      controller buyer.user
+      do
+        iou <- fetch iouCId
+        assertMsg "Iou amount and ask price don't match" (iou.amount == price)
+        assertMsg "You can't accept your own offer" (seller /= buyer)
+        exercise iouCId Transfer with newOwner = seller.user
+        exercise prediction TransferPrediction with newOwner = buyer
+        pure ()
+
+template PredictionOwnership
+  with
+    market: Market
+    owner: Participant
+    prediction: Prediction
+  where
+    signatory (signatory market)
+    
+    controller owner.user can 
+      TransferPrediction: ContractId PredictionOwnership
+        with newOwner: Participant
+        do create PredictionOwnership with owner = newOwner; ..
+
+      nonconsuming ShowOwnership: ContractId ShowPredictionOwnership
+        with prospect: Party
+        do create ShowPredictionOwnership with offeredPredictionCId = self; ..
+    
+    nonconsuming choice PublicFetch
+      : PredictionOwnership
+      with actor: Party
+      controller actor
+      do
+        pure (this)
+
+template ShowPredictionOwnership
+  with
+    owner: Participant
+    offeredPredictionCId: ContractId PredictionOwnership
+    prospect: Party
+  where
+    signatory (signatory owner)
+    observer prospect
+    
+    controller owner.user can
+      ConsumeShowPredictionOwnership: ()
+        do
+          fetch offeredPredictionCId
+          pure ()
+
+template MustPay with
+    issuer : Party
+    owner : Party
+  where
+    signatory issuer, owner
+    agreement
+      show issuer <> " must pay " <>
+      show owner <> " one unit of value"
+
+template Iou with
+    issuer : Party
+    owner : Party
+    amount: Decimal
+  where
+    signatory issuer
+
+    controller owner can
+      Transfer
+        : ContractId Iou
+        with newOwner : Party
+        do create Iou with owner = newOwner; ..
+
+      Settle
+        : ContractId MustPay
+        do create MustPay with ..
+
+      Split: (ContractId Iou, ContractId Iou)
+        with newAmount: Decimal
+        do
+          assertMsg "newAmount must be <= current amount" (newAmount <= amount)
+          one <- create Iou with amount = newAmount; ..
+          two <- create Iou with amount = amount - newAmount; ..
+          pure (one, two)
+
+      nonconsuming ShowIouOwnership: ContractId ShowIou
+        with prospect: Party
+        do create ShowIou with ownedIou = self; ..
+
+template ShowIou
+  with
+    owner: Party
+    ownedIou: ContractId Iou
+    prospect: Party
+  where
+    signatory owner
+    observer prospect
+    
+    controller owner can
+      ConsumeShowIou: ()
+        do
+          fetch ownedIou
+          pure ()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+example = script do 
+  -- P for Party
+  marketP <- allocatePartyWithHint "Market" (PartyIdHint "Market")
+  publicP <- allocatePartyWithHint "public" (PartyIdHint "public")
+  bankP <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+
+  u1P <- allocatePartyWithHint "u1" (PartyIdHint "u1")
+  u2P <- allocatePartyWithHint "u2" (PartyIdHint "u2")
+  u3P <- allocatePartyWithHint "u3" (PartyIdHint "u3")
+  o1P <- allocatePartyWithHint "o1" (PartyIdHint "o1")
+  o2P <- allocatePartyWithHint "o2" (PartyIdHint "o2")
+  o3P <- allocatePartyWithHint "o3" (PartyIdHint "o3")
+
+  marketCId <- submit marketP do createCmd Market with owner = marketP
+  
+  -- create participants
+  u1CId <- submit u1P do
+    createCmd Participant with
+      user = u1P
+      name = "u1"
+
+  u1Money <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+
+  
+  u2Money1 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u2P; amount = 1.0
+  u2Money2 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u2P; amount = 1.0
+  u3Money1 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u3P; amount = 0.3
+  u3Money2 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u3P; amount = 0.4
+
+  u2CId <- submit u2P do
+    createCmd Participant with
+      user = u2P
+      name = "u2"
+
+  u3CId <- submit u3P do
+    createCmd Participant with
+      user = u3P
+      name = "u3"
+  
+  -- create serviceagreements
+  Some market <- queryContractId marketP marketCId
+  Some u1 <- queryContractId u1P u1CId
+  Some u2 <- queryContractId u2P u2CId
+  Some u3 <- queryContractId u3P u3CId
+
+
+  u1Req <- submit u1P do
+    exerciseCmd u1CId RequestParticipation with
+      market = market
+  
+  u2Req <- submit u2P do exerciseCmd u2CId RequestParticipation with market = market
+  u3Req <- submit u3P do exerciseCmd u3CId RequestParticipation with market = market
+
+  u1SLA <- submit marketP do exerciseCmd u1Req Accept
+  u2SLA <- submit marketP do exerciseCmd u2Req Accept
+  u3SLA <- submit marketP do exerciseCmd u3Req Accept
+
+  -- create oracles
+  o1CId <- submit o1P do 
+    createCmd Oracle with 
+      entity = o1P
+      eventResolutions = []
+      market = market
+      public = publicP
+  
+  o2CId <- submit o2P do createCmd Oracle with entity = o2P; eventResolutions = []; market = market; public = publicP
+  o3CId <- submit o3P do createCmd Oracle with entity = o3P; eventResolutions = []; market = market; public = publicP
+  Some o1 <- queryContractId o1P o1CId
+  Some o2 <- queryContractId o2P o2CId
+  Some o3 <- queryContractId o3P o3CId
+  
+  -- setTime (time (D.date 2020 Dec 15) 0 0 0)
+
+  eventCid <- submit marketP do
+    createCmd Event with
+      description = "Will all uses of DAML over Daml be purged by 31.12.2021?"
+      resolutionDate = D.date 2022 Jan 1
+      market = marketP
+      oracle = o1
+      outcome = None
+      public = publicP
+
+  eventCid2 <- submit marketP do
+    createCmd Event with
+      description = "Will a democratic candidate win the 2020 US presidency election?"
+      resolutionDate = D.date 2020 Nov 3
+      market = marketP
+      oracle = o1
+      outcome = None
+      public = publicP
+
+  
+  Some event <- queryContractId publicP eventCid
+
+  (u1NoOwnership, u1YesOwnership) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money
+  (u2NoOwnership1, u2YesOwnership1) <- submit u2P do exerciseCmd u2SLA BuyIn with event = event; iouCId = u2Money1
+  (u2NoOwnership2, u2YesOwnership2) <- submit u2P do exerciseCmd u2SLA BuyIn with event = event; iouCId = u2Money2
+  submitMustFail u2P do exerciseCmd u2SLA BuyIn with event = event; iouCId = u2Money2
+
+    -- trying to sell something that doesn't belong to you fails
+  submitMustFail u2P do
+    exerciseCmd u2CId CreateSellProposal with
+      price = 1.0
+      prediction = u1NoOwnership
+      public = publicP
+      uuid = 1
+  
+  ----------
+  -- sale of 1 no-share from u2 to u3
+------------
+  -- sale proposal is created
+  sellProposal <- submit u2P do 
+    exerciseCmd u2CId CreateSellProposal with
+      price = 0.3
+      prediction = u2NoOwnership1
+      public = publicP
+      uuid = 2
+
+  -- u3 accepts the sellproposal through multi-party submission
+  acceptedProp <- submitMulti [u3P] [publicP] do
+    exerciseCmd sellProposal AcceptSellProposal with buyer = u3; iouCId = u3Money1
+
+  -- trying to sell the same share again should fail
+  submitMustFail u2P do 
+    exerciseCmd u2CId CreateSellProposal with
+      price = 0.3
+      prediction = u2NoOwnership1
+      public = publicP
+      uuid = 3
+
+  -------
+  -- buy of 1 no-share by u3 from u1
+  -------
+  buyProposal <- submit u3P do 
+    exerciseCmd u3CId CreateBuyProposal with
+      iou = u3Money2
+      prediction = Prediction with eventOccurs = False; ..
+      public = publicP
+      uuid = 4
+
+  acceptedProp <- submitMulti [u1P] [publicP] do
+    exerciseCmd buyProposal AcceptBuyProposal with seller = u1; offeredPredictionCId = u1NoOwnership
+
+
+  testMoney <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = marketP; amount = 1.0
+  submit marketP do
+    exerciseCmd testMoney Transfer with newOwner = u1P
+
+  -- setTime (time (D.date 2020 Dec 16) 0 0 0)
+
+  u1Money2 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+  u1Money3 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+  u1Money4 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+  u1Money5 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+  u1Money6 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 1.0
+  u1Money7 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 0.42
+  u1Money8 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 0.42
+  u1Money9 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 0.41
+  u1Money10 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 0.41
+  u1Money11 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 0.41
+  u1Money12 <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u1P; amount = 100.0
+  u2Money <- submit bankP do
+    createCmd Iou with issuer = bankP; owner = u2P; amount = 5.0
+
+  (u1NoOwnership2, u1YesOwnership2) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money2
+  (u1NoOwnership3, u1YesOwnership3) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money3
+  (u1NoOwnership4, u1YesOwnership4) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money4
+  (u1NoOwnership5, u1YesOwnership5) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money5
+  (u1NoOwnership6, u1YesOwnership6) <- submit u1P do
+    exerciseCmd u1SLA BuyIn with event = event; iouCId = u1Money6
+
+  -- setting up some data for demo
+
+  sellProposal <- submit u1P do 
+    exerciseCmd u1CId CreateSellProposal with
+      price = 0.45
+      prediction = u1YesOwnership2
+      public = publicP
+      uuid = 5
+  sellProposal <- submit u1P do 
+    exerciseCmd u1CId CreateSellProposal with
+      price = 0.45
+      prediction = u1YesOwnership3
+      public = publicP
+      uuid = 6
+  sellProposal <- submit u1P do 
+    exerciseCmd u1CId CreateSellProposal with
+      price = 0.45
+      prediction = u1YesOwnership4
+      public = publicP
+      uuid = 7
+  sellProposal <- submit u1P do 
+    exerciseCmd u1CId CreateSellProposal with
+      price = 0.47
+      prediction = u1YesOwnership5
+      public = publicP
+      uuid = 8
+  sellProposalx <- submit u1P do 
+    exerciseCmd u1CId CreateSellProposal with
+      price = 0.47
+      prediction = u1YesOwnership6
+      public = publicP
+      uuid = 9
+
+ 
+
+
+  let eventOccursPrediction = Prediction with eventOccurs = True; ..
+  buyProposal <- submit u1P do 
+    exerciseCmd u1CId CreateBuyProposal with
+      iou = u1Money7
+      prediction = eventOccursPrediction
+      public = publicP
+      uuid = 10
+  buyProposal <- submit u1P do 
+    exerciseCmd u1CId CreateBuyProposal with
+      iou = u1Money8
+      prediction = eventOccursPrediction
+      public = publicP
+      uuid = 11
+  buyProposal <- submit u1P do 
+    exerciseCmd u1CId CreateBuyProposal with
+      iou = u1Money9
+      prediction = eventOccursPrediction
+      public = publicP
+      uuid = 12
+  buyProposal <- submit u1P do 
+    exerciseCmd u1CId CreateBuyProposal with
+      iou = u1Money10
+      prediction = eventOccursPrediction
+      public = publicP
+      uuid = 13
+  buyProposal <- submit u1P do 
+    exerciseCmd u1CId CreateBuyProposal with
+      iou = u1Money11
+      prediction = eventOccursPrediction
+      public = publicP
+      uuid = 14
+  pure()
